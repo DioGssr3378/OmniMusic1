@@ -4,13 +4,11 @@ import android.Manifest
 import android.app.Activity
 import android.content.ContentUris
 import android.content.pm.PackageManager
-import android.content.res.ColorStateList
+import android.animation.ValueAnimator
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Path
-import android.graphics.PixelFormat
-import android.graphics.drawable.Drawable
-import android.graphics.drawable.RippleDrawable
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -20,8 +18,13 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.widget.*
+import android.view.animation.DecelerateInterpolator
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.hypot
 
 class MainActivity : Activity() {
     data class Song(val id: Long, val title: String, val artist: String, val uri: Uri)
@@ -34,7 +37,7 @@ class MainActivity : Activity() {
     private lateinit var inter: Typeface
     private lateinit var interBold: Typeface
     private val green = Color.rgb(118, 255, 81)
-    private val background = Color.rgb(9, 13, 12)
+    private val appBackgroundColor = Color.rgb(9, 13, 12)
     private val card = Color.rgb(35, 39, 39)
     private val muted = Color.rgb(168, 178, 175)
 
@@ -46,37 +49,94 @@ class MainActivity : Activity() {
             if (border != null) setStroke(dp(1f), border)
         }
 
-    // Ripple hexagonal translúcido, centrado en el punto de contacto.
-    private fun hexRipple(): RippleDrawable {
-        val mask = object : Drawable() {
-            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-            override fun draw(canvas: Canvas) {
-                val b = bounds
-                val cx = b.exactCenterX()
-                val cy = b.exactCenterY()
-                val r = minOf(b.width(), b.height()) * 0.47f
-                val path = Path()
+    private lateinit var playButton: TextView
+
+    // Dibuja un hexágono que se expande desde el punto pulsado y se desvanece.
+    private fun enableHexPulse(target: View, radiusDp: Float) {
+        val overlay = object : View(this) {
+            var progress = 1f
+            var touchX = 0f
+            var touchY = 0f
+            private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = green; style = Paint.Style.FILL }
+            private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = green; style = Paint.Style.STROKE; strokeWidth = dp(1.5f).toFloat()
+            }
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                if (progress >= 1f) return
+                val save = canvas.save()
+                val clip = Path().apply {
+                    addRoundRect(RectF(0f, 0f, width.toFloat(), height.toFloat()),
+                        dp(radiusDp).toFloat(), dp(radiusDp).toFloat(), Path.Direction.CW)
+                }
+                canvas.clipPath(clip)
+                val maxRadius = listOf(
+                    hypot(touchX, touchY), hypot(width - touchX, touchY),
+                    hypot(touchX, height - touchY), hypot(width - touchX, height - touchY)
+                ).maxOrNull() ?: 0f
+                val radius = maxRadius * (0.08f + progress * 1.15f)
+                val hex = Path()
                 for (i in 0 until 6) {
                     val angle = Math.toRadians((60 * i - 30).toDouble())
-                    val x = cx + (r * kotlin.math.cos(angle)).toFloat()
-                    val y = cy + (r * kotlin.math.sin(angle)).toFloat()
-                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    val x = touchX + (radius * cos(angle)).toFloat()
+                    val y = touchY + (radius * sin(angle)).toFloat()
+                    if (i == 0) hex.moveTo(x, y) else hex.lineTo(x, y)
                 }
-                path.close()
-                canvas.drawPath(path, paint)
+                hex.close()
+                val fade = (1f - progress).coerceIn(0f, 1f)
+                fill.alpha = (95f * fade).toInt()
+                stroke.alpha = (175f * fade).toInt()
+                canvas.drawPath(hex, fill)
+                canvas.drawPath(hex, stroke)
+                canvas.restoreToCount(save)
             }
-            override fun setAlpha(alpha: Int) { paint.alpha = alpha; invalidateSelf() }
-            override fun setColorFilter(filter: android.graphics.ColorFilter?) { paint.colorFilter = filter; invalidateSelf() }
-            @Deprecated("Deprecated in Java")
-            override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
         }
-        return RippleDrawable(ColorStateList.valueOf(Color.argb(105, 118, 255, 81)), null, mask)
+        // El overlay es el foreground del control: no bloquea sus clics.
+        val layer = object : android.graphics.drawable.Drawable() {
+            override fun draw(canvas: Canvas) {
+                overlay.layout(0, 0, bounds.width(), bounds.height())
+                overlay.draw(canvas)
+            }
+            override fun setAlpha(alpha: Int) {}
+            override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
+            @Deprecated("Deprecated in Java")
+            override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
+        }
+        target.foreground = layer
+        var animator: ValueAnimator? = null
+        target.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                animator?.cancel()
+                overlay.touchX = event.x
+                overlay.touchY = event.y
+                overlay.progress = 0f
+                animator = ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 340L
+                    interpolator = DecelerateInterpolator(1.15f)
+                    addUpdateListener {
+                        overlay.progress = it.animatedValue as Float
+                        target.invalidate()
+                    }
+                    start()
+                }
+                target.invalidate()
+            }
+            false
+        }
+    }
+
+    private fun updatePlayButton() {
+        if (::playButton.isInitialized) {
+            val playing = player?.isPlaying == true
+            playButton.text = if (playing) "Ⅱ" else "▶"
+            playButton.contentDescription = if (playing) "Pausar" else "Reproducir"
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = background
-        window.navigationBarColor = background
+        window.statusBarColor = appBackgroundColor
+        window.navigationBarColor = appBackgroundColor
         font = try { Typeface.createFromAsset(assets, "CrashLandingBB.ttf") }
         catch (_: Exception) { Typeface.DEFAULT }
         inter = try { Typeface.createFromAsset(assets, "Inter-Regular.otf") } catch (_: Exception) { Typeface.DEFAULT }
@@ -84,7 +144,7 @@ class MainActivity : Activity() {
 
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(this@MainActivity.background)
+            setBackgroundColor(appBackgroundColor)
             setPadding(dp(16f), dp(28f), dp(16f), dp(12f))
         }
         // Respect the system status/navigation bars, including Android edge-to-edge.
@@ -131,7 +191,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             orientation = LinearLayout.HORIZONTAL
         }
-        fun control(label: String, primary: Boolean = false, action: () -> Unit) {
+        fun control(label: String, primary: Boolean = false, action: () -> Unit): TextView {
             val b = TextView(this).apply {
                 text = label
                 textSize = 24f
@@ -140,22 +200,24 @@ class MainActivity : Activity() {
                 setTextColor(if (primary) Color.BLACK else green)
                 background = shape(if (primary) green else card, 18f,
                     if (primary) null else Color.rgb(58, 72, 66))
-                foreground = hexRipple()
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { action() }
+                enableHexPulse(this, 18f)
             }
             val params = LinearLayout.LayoutParams(0, dp(58f), if (primary) 1.15f else 1f).apply {
                 marginStart = dp(4f); marginEnd = dp(4f)
             }
             controls.addView(b, params)
+            return b
         }
         control("◀◀") { if (songs.isNotEmpty()) play((current - 1 + songs.size) % songs.size) }
-        control("▶ / ❚❚", primary = true) {
+        playButton = control("▶", primary = true) {
             val p = player
             if (p == null && songs.isNotEmpty()) play(0)
             else if (p?.isPlaying == true) p.pause()
             else p?.start()
+            updatePlayButton()
         }
         control("▶▶") { if (songs.isNotEmpty()) play((current + 1) % songs.size) }
         page.addView(controls)
@@ -207,10 +269,10 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(14f), dp(12f), dp(12f), dp(12f))
                 background = shape(card, 16f, Color.rgb(56, 66, 62))
-                foreground = hexRipple()
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { play(index) }
+                enableHexPulse(this, 16f)
             }
             val symbol = TextView(this).apply {
                 text = "♫"
@@ -254,6 +316,7 @@ class MainActivity : Activity() {
             start()
         }
         now.text = "♫  ${songs[index].title} — ${songs[index].artist}"
+        updatePlayButton()
     }
 
     override fun onDestroy() { player?.release(); player = null; super.onDestroy() }
