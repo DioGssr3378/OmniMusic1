@@ -45,7 +45,7 @@ class MainActivity : Activity() {
 
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(background)
+            setBackgroundColor(this@MainActivity.background)
             setPadding(dp(16f), dp(20f), dp(16f), dp(12f))
         }
         // Respect the system status/navigation bars, including Android edge-to-edge.
