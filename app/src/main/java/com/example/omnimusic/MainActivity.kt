@@ -50,7 +50,7 @@ class MainActivity : Activity() {
     private lateinit var fullTitle: TextView
     private lateinit var fullArt: AlbumArt
     private lateinit var fullTime: TextView
-    private lateinit var fullFavorite: TextView
+    private lateinit var fullFavorite: PixelHeart
     private lateinit var fullPlay: ActionButton
     private lateinit var fullPanel: LinearLayout
     private lateinit var spectrum: Spectrum
@@ -181,7 +181,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // Barra táctil con hexágonos confinados al avance y cortes diagonales.
+    // Barra segmentada táctil con un pequeño spray de hexágonos SOLO en el frente del avance.
     private inner class SegmentedProgress : View(this@MainActivity) {
         var fraction = 0f
             set(value) { field = value.coerceIn(0f, 1f); invalidate() }
@@ -209,104 +209,231 @@ class MainActivity : Activity() {
             val w = width.toFloat(); val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
             val top = dp(6f).toFloat(); val bottom = h - dp(6f)
-            val save = canvas.save()
-            canvas.clipPath(Path().apply { addRoundRect(RectF(0f, top, w, bottom), dp(6f).toFloat(), dp(6f).toFloat(), Path.Direction.CW) })
-            p.style = Paint.Style.FILL
-            p.color = Color.rgb(49, 65, 56); canvas.drawRect(0f, top, w, bottom, p)
-            val fill = w * fraction
-            p.color = green; canvas.drawRect(0f, top, fill, bottom, p)
-            val r = dp(3.2f).toFloat()
-            val step = dp(15f).toFloat()
-            var x = step / 2
-            while (x < fill) {
-                val cy = (top + bottom) / 2
-                val path = Path()
-                repeat(6) { i ->
-                    val a = Math.toRadians((i * 60 - 30).toDouble())
-                    val px = x + r * cos(a).toFloat(); val py = cy + r * sin(a).toFloat()
-                    if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
-                }
-                path.close(); p.color = Color.argb(110, 8, 74, 20); canvas.drawPath(path, p)
-                x += step
+            val clip = Path().apply {
+                addRoundRect(RectF(0f, top, w, bottom), dp(6f).toFloat(), dp(6f).toFloat(), Path.Direction.CW)
             }
-            p.color = appBackgroundColor; p.strokeWidth = dp(3f).toFloat()
+            val save = canvas.save()
+            canvas.clipPath(clip)
+            p.style = Paint.Style.FILL
+            p.color = Color.rgb(49, 65, 56)
+            canvas.drawRect(0f, top, w, bottom, p)
+            val tip = w * fraction
+            p.color = green
+            canvas.drawRect(0f, top, tip, bottom, p)
+
+            // Las partículas nacen en la punta, se dispersan hacia atrás, y se apagan.
+            // No forman una trama estática a lo largo de toda la barra.
+            if (tip > dp(4f)) {
+                val clock = android.os.SystemClock.uptimeMillis() / 1000f
+                val cy = (top + bottom) / 2f
+                for (i in 0 until 15) {
+                    val age = (clock * 1.8f + i * 0.137f) % 1f
+                    val x = tip + dp(3f) - age * dp(37f)
+                    val drift = sin(i * 2.399f + clock * 0.65f) * dp(7f) * age
+                    val y = cy + drift
+                    if (x < 0f || x > w) continue
+                    val radius = dp(2.9f) * (1f - age * 0.56f)
+                    val hex = Path()
+                    for (corner in 0 until 6) {
+                        val angle = Math.toRadians((corner * 60 - 30).toDouble())
+                        val px = x + radius * cos(angle).toFloat()
+                        val py = y + radius * sin(angle).toFloat()
+                        if (corner == 0) hex.moveTo(px, py) else hex.lineTo(px, py)
+                    }
+                    hex.close()
+                    p.color = Color.argb((235 * (1f - age) * (1f - age)).toInt().coerceIn(0, 255), 202, 255, 175)
+                    canvas.drawPath(hex, p)
+                }
+            }
+            p.color = appBackgroundColor
+            p.strokeWidth = dp(3f).toFloat()
             repeat(3) { i ->
-                val pos = w * (i + 1) / 4f
-                canvas.drawLine(pos + dp(3f), top, pos - dp(3f), bottom, p)
+                val x = w * (i + 1) / 4f
+                canvas.drawLine(x + dp(3f), top, x - dp(3f), bottom, p)
             }
             canvas.restoreToCount(save)
+            if (isShown && player?.isPlaying == true) postInvalidateDelayed(45L)
         }
     }
 
-    // Espectro real: toma la forma de onda de la sesión de audio de MediaPlayer.
+    // Analizador FFT real: columnas apiladas, ancladas ABAJO de la portada.
+    // Ataque rápido y caída más lenta para acompañar los golpes sin parpadeos.
     private inner class Spectrum : View(this@MainActivity) {
-        private val levels = FloatArray(24) { .08f }
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        fun update(wave: ByteArray) {
-            if (wave.isEmpty()) return
-            for (i in levels.indices) {
-                val from = i * wave.size / levels.size
-                val to = ((i + 1) * wave.size / levels.size).coerceAtMost(wave.size)
-                var peak = 0f
-                for (j in from until to) peak = max(peak, abs(wave[j].toInt().toFloat()) / 128f)
-                levels[i] = levels[i] * .45f + peak * .55f
-            }
-            postInvalidate()
+        private val columns = 30
+        private val display = FloatArray(columns)
+        private val targets = FloatArray(columns)
+        private val paint = Paint().apply { isAntiAlias = false }
+        private var active = false
+        private var autoPeak = 0.27f
+        private var lastFrameMs = 0L
+
+        fun setActive(value: Boolean) {
+            active = value
+            lastFrameMs = android.os.SystemClock.uptimeMillis()
+            if (active) postInvalidateOnAnimation()
         }
-        override fun onDraw(c: Canvas) {
-            val slot = width.toFloat() / levels.size
-            val unit = dp(4f).toFloat(); val gap = dp(2f).toFloat()
-            for (i in levels.indices) {
-                val count = (1 + levels[i] * 11).toInt().coerceIn(1, 12)
-                for (j in 0 until count) {
-                    paint.color = if (j >= count - 2) green else Color.rgb(49, 160 + (j * 6).coerceAtMost(80), 51)
-                    val y = height / 2f + count * (unit + gap) / 2f - (j + 1) * (unit + gap)
-                    c.drawRoundRect(i * slot + dp(1f), y, (i + 1) * slot - dp(1f), y + unit, dp(1.5f).toFloat(), dp(1.5f).toFloat(), paint)
+        fun reset() {
+            display.fill(0f); targets.fill(0f); autoPeak = .27f
+            invalidate()
+        }
+        fun updateFft(fft: ByteArray) {
+            if (!active || fft.size < 64) return
+            // Cada par de bytes es una frecuencia compleja (real e imaginaria).
+            val available = fft.size / 2 - 1
+            val maxBin = min(available, 220)
+            var peak = 0f
+            val band = FloatArray(columns)
+            for (i in 0 until columns) {
+                val low = max(1, (2.0 * (maxBin / 2.0).pow(i.toDouble() / columns)).toInt())
+                val high = min(maxBin, max(low + 1,
+                    (2.0 * (maxBin / 2.0).pow((i + 1.0) / columns)).toInt()))
+                var sum = 0f
+                var count = 0
+                for (bin in low until high) {
+                    val re = fft[bin * 2].toInt().toFloat()
+                    val im = fft[bin * 2 + 1].toInt().toFloat()
+                    sum += sqrt(re * re + im * im)
+                    count++
+                }
+                // Logaritmo comprime los golpes intensos y revela las frecuencias suaves.
+                val mag = if (count > 0) sum / count else 0f
+                val valLog = (ln(1f + mag * 2.2f) / ln(1f + 128f * 2.2f)).coerceIn(0f, 1f)
+                band[i] = valLog
+                peak = max(peak, valLog)
+            }
+            autoPeak = max(peak, autoPeak * .973f).coerceAtLeast(.18f)
+            for (i in 0 until columns) {
+                val boost = (band[i] / autoPeak).coerceIn(0f, 1.25f)
+                targets[i] = ((boost - .055f).coerceAtLeast(0f) * 1.07f).coerceIn(0f, 1f)
+            }
+            postInvalidateOnAnimation()
+        }
+        override fun onDraw(canvas: Canvas) {
+            if (width <= 0 || height <= 0) return
+            val now = android.os.SystemClock.uptimeMillis()
+            val dt = if (lastFrameMs == 0L) 16f else (now - lastFrameMs).coerceIn(1L, 50L).toFloat()
+            lastFrameMs = now
+            val slot = width.toFloat() / columns
+            val barWidth = slot * .73f
+            val unit = dp(3.6f).toFloat().coerceAtLeast(2f)
+            val gap = dp(1.7f).toFloat().coerceAtLeast(1f)
+            val bottom = height - dp(4f).toFloat()
+            val maxUnits = ((height * .94f) / (unit + gap)).toInt().coerceAtLeast(1)
+            val playing = player?.isPlaying == true
+            for (i in 0 until columns) {
+                val goal = if (playing) targets[i] else 0f
+                val factor = if (goal > display[i]) .54f else .085f
+                val smoothing = 1f - (1f - factor).pow(dt / 16f)
+                display[i] += (goal - display[i]) * smoothing
+                val blocks = (display[i] * maxUnits).toInt().coerceIn(0, maxUnits)
+                val left = i * slot + (slot - barWidth) / 2f
+                for (j in 0 until blocks) {
+                    val y = bottom - (j + 1) * (unit + gap)
+                    val energy = j.toFloat() / maxUnits
+                    paint.color = if (energy > .65f) Color.rgb(193, 255, 132)
+                        else if (energy > .3f) green else Color.rgb(68, 211, 75)
+                    paint.alpha = 225
+                    canvas.drawRect(left, y, left + barWidth, y + unit, paint)
                 }
             }
+            if (active && isShown) postInvalidateOnAnimation()
         }
     }
 
-    // Botón sin contorno: la forma verde nace en el centro y se convierte en rombo.
+    // Controles minimalistas. Solo el símbolo y el hexágono expansivo al pulsar.
     private inner class ActionButton(val symbol: String, val primary: Boolean = false) : View(this@MainActivity) {
-        var paused = false
-            set(value) { field = value; invalidate() }
-        private var morph = 0f
-        private var rotation = 0f
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private var anim: ValueAnimator? = null
+        private var paused = true
+        private var previous = "▶"
+        private var transition = 1f
+        private var animator: ValueAnimator? = null
+        private var tapScale = 1f
         init { isClickable = true; isFocusable = true }
         fun animateAction(toPaused: Boolean, quick: Boolean = false) {
-            anim?.cancel()
-            val target = if (toPaused) 1f else 0f
-            anim = ValueAnimator.ofFloat(morph, target).apply {
-                duration = if (quick) 260 else 470
-                addUpdateListener {
-                    morph = it.animatedValue as Float
-                    rotation = morph * 45f
-                    invalidate()
-                }
+            if (!primary) { flash(); return }
+            if (paused == toPaused) return
+            animator?.cancel()
+            previous = if (paused) "▶" else "Ⅱ"
+            paused = toPaused
+            transition = 0f
+            animator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = if (quick) 150 else 220
+                interpolator = DecelerateInterpolator()
+                addUpdateListener { transition = it.animatedValue as Float; invalidate() }
                 start()
             }
-            paused = toPaused
+        }
+        fun flash() {
+            animate().cancel()
+            animate().scaleX(.84f).scaleY(.84f).setDuration(85).withEndAction {
+                animate().scaleX(1f).scaleY(1f).setDuration(135).start()
+            }.start()
         }
         override fun onDraw(c: Canvas) {
             val cx = width / 2f; val cy = height / 2f
-            val size = min(width, height).toFloat() * .40f
-            val radius = min(width, height) * (.04f + .42f * morph)
-            if (morph > .001f) {
+            paint.textAlign = Paint.Align.CENTER
+            paint.textSize = dp(if (primary) 34f else 29f).toFloat()
+            paint.typeface = Typeface.DEFAULT_BOLD
+            paint.style = Paint.Style.FILL
+            val baseline = cy - (paint.ascent() + paint.descent()) / 2f
+            if (primary && transition < 1f) {
                 val save = c.save()
-                c.rotate(rotation, cx, cy)
-                val s = size * (.2f + .8f * morph)
-                paint.color = green; paint.style = Paint.Style.FILL
-                c.drawRoundRect(cx - s, cy - s, cx + s, cy + s, radius * (1f - morph * .85f), radius * (1f - morph * .85f), paint)
+                c.scale(1f - .16f * transition, 1f - .16f * transition, cx, cy)
+                paint.color = green; paint.alpha = (255 * (1f - transition)).toInt()
+                c.drawText(previous, cx, baseline, paint)
                 c.restoreToCount(save)
             }
-            paint.color = if (morph > .55f) Color.WHITE else green
-            paint.textSize = dp(29f).toFloat(); paint.typeface = Typeface.DEFAULT_BOLD
-            paint.textAlign = Paint.Align.CENTER; paint.style = Paint.Style.FILL
             val glyph = if (primary) (if (paused) "▶" else "Ⅱ") else symbol
-            c.drawText(glyph, cx, cy - (paint.ascent() + paint.descent()) / 2f, paint)
+            val incomingAlpha = if (primary) transition else 1f
+            val save = c.save()
+            if (primary) {
+                val zoom = .84f + .16f * transition
+                c.scale(zoom, zoom, cx, cy)
+            }
+            paint.color = green; paint.alpha = (255 * incomingAlpha).toInt()
+            c.drawText(glyph, cx, baseline, paint)
+            c.restoreToCount(save)
+            paint.alpha = 255
+        }
+    }
+
+    // Corazón pixel-art: silueta calculada como píxeles, borde vacío o relleno verde.
+    private inner class PixelHeart : View(this@MainActivity) {
+        private val shapePixels = arrayOf(
+            "..###.....###..",
+            ".#####...#####.",
+            "###############",
+            "###############",
+            ".#############.",
+            "..###########..",
+            "...#########...",
+            "....#######....",
+            ".....#####.....",
+            "......###......",
+            ".......#......."
+        )
+        private val p = Paint().apply { isAntiAlias = false; style = Paint.Style.FILL }
+        var filled = false
+            set(value) { field = value; invalidate() }
+        init { isClickable = true; isFocusable = true }
+        override fun onDraw(c: Canvas) {
+            val rows = shapePixels.size
+            val cols = shapePixels[0].length
+            val cell = min(width.toFloat() / (cols + 2), height.toFloat() / (rows + 2))
+            val left = (width - cols * cell) / 2f
+            val top = (height - rows * cell) / 2f
+            for (y in 0 until rows) for (x in 0 until cols) {
+                if (shapePixels[y][x] != '#') continue
+                val edge = (x == 0 || shapePixels[y][x - 1] != '#') ||
+                    (x == cols - 1 || shapePixels[y][x + 1] != '#') ||
+                    (y == 0 || shapePixels[y - 1][x] != '#') ||
+                    (y == rows - 1 || shapePixels[y + 1][x] != '#')
+                if (filled || edge) {
+                    p.color = green
+                    c.drawRect(left + x * cell, top + y * cell,
+                        left + (x + 1) * cell, top + (y + 1) * cell, p)
+                }
+            }
         }
     }
 
@@ -318,7 +445,7 @@ class MainActivity : Activity() {
         if (section == "Favoritos") showSection("Favoritos")
     }
     private fun updateFavorite() {
-        if (::fullFavorite.isInitialized) fullFavorite.text = if (songs.getOrNull(current)?.let { isFavorite(it.id) } == true) "♥" else "♡"
+        if (::fullFavorite.isInitialized) fullFavorite.filled = songs.getOrNull(current)?.let { isFavorite(it.id) } == true
     }
     private fun refreshProgress() {
         val mp = player ?: return
@@ -340,11 +467,14 @@ class MainActivity : Activity() {
             visualizer = Visualizer(mp.audioSessionId).apply {
                 captureSize = Visualizer.getCaptureSizeRange()[1]
                 setDataCaptureListener(object : Visualizer.OnDataCaptureListener {
-                    override fun onWaveFormDataCapture(v: Visualizer?, waveform: ByteArray?, rate: Int) {
-                        if (waveform != null && ::spectrum.isInitialized) spectrum.post { spectrum.update(waveform) }
+                    override fun onWaveFormDataCapture(v: Visualizer?, waveform: ByteArray?, rate: Int) { }
+                    override fun onFftDataCapture(v: Visualizer?, fft: ByteArray?, rate: Int) {
+                        if (fft != null && ::spectrum.isInitialized) {
+                            val copy = fft.copyOf()
+                            spectrum.post { spectrum.updateFft(copy) }
+                        }
                     }
-                    override fun onFftDataCapture(v: Visualizer?, fft: ByteArray?, rate: Int) { }
-                }, Visualizer.getMaxCaptureRate() / 2, true, false)
+                }, Visualizer.getMaxCaptureRate() / 2, false, true)
                 enabled = true
             }
         } catch (_: Exception) { visualizer?.release(); visualizer = null }
@@ -573,6 +703,7 @@ class MainActivity : Activity() {
     private fun openFullPlayer() {
         if (current !in songs.indices) return
         expanded = true
+        spectrum.setActive(true)
         fullPanel.visibility = View.VISIBLE
         dock.visibility = View.GONE
         folderList.visibility = View.GONE
@@ -587,6 +718,8 @@ class MainActivity : Activity() {
     }
     private fun closeFullPlayer() {
         expanded = false
+        spectrum.setActive(false)
+        visualizer?.release(); visualizer = null
         fullPanel.visibility = View.GONE
         dock.visibility = View.VISIBLE
         scrollView.visibility = View.VISIBLE
@@ -613,16 +746,18 @@ class MainActivity : Activity() {
         val tint = View(this).apply { setBackgroundColor(Color.argb(52, 65, 240, 62)) }
         artBox.addView(tint, android.widget.FrameLayout.LayoutParams(-1, -1))
         spectrum = Spectrum()
-        artBox.addView(spectrum, android.widget.FrameLayout.LayoutParams(-1, dp(140f), Gravity.CENTER))
+        // Ocupa toda la portada. Los rectángulos crecen desde el borde inferior.
+        artBox.addView(spectrum, android.widget.FrameLayout.LayoutParams(-1, -1, Gravity.BOTTOM))
         panel.addView(artBox, LinearLayout.LayoutParams(-1, 0, 1f))
         val info = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         fullTitle = text("", 20f, Color.WHITE, interBold)
         info.addView(fullTitle, LinearLayout.LayoutParams(0, -2, 1f))
-        fullFavorite = text("♡", 35f, green, Typeface.DEFAULT).apply {
-            gravity = Gravity.CENTER; contentDescription = "Agregar o quitar de favoritos"
-            isClickable = true; setOnClickListener { toggleFavorite() }
+        fullFavorite = PixelHeart().apply {
+            contentDescription = "Agregar o quitar de favoritos"
+            setOnClickListener { toggleFavorite() }
         }
         info.addView(fullFavorite, LinearLayout.LayoutParams(dp(50f), dp(54f)))
+        hexPulse(fullFavorite, 14f)
         panel.addView(info)
         fullProgress = SegmentedProgress()
         panel.addView(fullProgress, LinearLayout.LayoutParams(-1, dp(36f)))
@@ -633,11 +768,12 @@ class MainActivity : Activity() {
             val b = ActionButton(symbol, primary)
             buttons.addView(b, LinearLayout.LayoutParams(0, dp(76f), 1f))
             b.setOnClickListener { action(b) }
+            hexPulse(b, 18f)
             return b
         }
-        add("◀◀", false) { b -> b.animateAction(true, true); if (songs.isNotEmpty()) play((current - 1 + songs.size) % songs.size); b.postDelayed({ b.animateAction(false, true) }, 270) }
+        add("◀◀", false) { b -> b.flash(); if (songs.isNotEmpty()) play((current - 1 + songs.size) % songs.size) }
         fullPlay = add("▶", true) { togglePlayback() }
-        add("▶▶", false) { b -> b.animateAction(true, true); if (songs.isNotEmpty()) play((current + 1) % songs.size); b.postDelayed({ b.animateAction(false, true) }, 270) }
+        add("▶▶", false) { b -> b.flash(); if (songs.isNotEmpty()) play((current + 1) % songs.size) }
         panel.addView(buttons)
         return panel
     }
@@ -650,6 +786,7 @@ class MainActivity : Activity() {
                 prepare(); start()
             }
             visualizer?.release(); visualizer = null
+            if (::spectrum.isInitialized) spectrum.reset()
             player?.release(); player = next; current = index
             val song = songs[index]
             playerTitle.text = song.title
@@ -672,6 +809,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
         visualizer?.release(); visualizer = null
+        if (::spectrum.isInitialized) spectrum.setActive(false)
         player?.release(); player = null
         super.onDestroy()
     }
